@@ -1,0 +1,15 @@
+.DS_Store
+.env
+go.work
+go.work.sum
+/scripts/node_modules/
+.fly/
+simulator/
+test-trade
+
+sessions/
+skills
+sources
+statuses
+labels
+.idea

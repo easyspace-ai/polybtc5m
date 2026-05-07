@@ -1,0 +1,110 @@
+package polymarket
+
+import (
+	"encoding/json"
+	"math"
+	"strings"
+	"testing"
+)
+
+func TestMarketBuyAmountsCapsHighPriceAtNinetyNineCents(t *testing.T) {
+	makerAmount, takerAmount, err := marketBuyAmounts(20, 0.9900000000000001)
+	if err != nil {
+		t.Fatalf("marketBuyAmounts returned error: %v", err)
+	}
+
+	if makerAmount != 20_000_000 {
+		t.Fatalf("makerAmount = %d, want 20000000", makerAmount)
+	}
+	if takerAmount != 20_202_000 {
+		t.Fatalf("takerAmount = %d, want 20202000", takerAmount)
+	}
+	if makerAmount%marketBuyMakerPrecision != 0 {
+		t.Fatalf("makerAmount = %d, want cents precision", makerAmount)
+	}
+	if takerAmount%marketBuyTakerPrecision != 0 {
+		t.Fatalf("takerAmount = %d, want 4-decimal precision", takerAmount)
+	}
+}
+
+func TestMarketBuyAmountsRoundsWorstPriceToTick(t *testing.T) {
+	makerAmount, takerAmount, err := marketBuyAmounts(20, 0.60)
+	if err != nil {
+		t.Fatalf("marketBuyAmounts returned error: %v", err)
+	}
+
+	if makerAmount != 20_000_000 {
+		t.Fatalf("makerAmount = %d, want 20000000", makerAmount)
+	}
+	if takerAmount != 31_746_000 {
+		t.Fatalf("takerAmount = %d, want 31746000", takerAmount)
+	}
+	if makerAmount%marketBuyMakerPrecision != 0 {
+		t.Fatalf("makerAmount = %d, want cents precision", makerAmount)
+	}
+	if takerAmount%marketBuyTakerPrecision != 0 {
+		t.Fatalf("takerAmount = %d, want 4-decimal precision", takerAmount)
+	}
+}
+
+func TestPostOrderBodySerializesSaltAsNumber(t *testing.T) {
+	body := postOrderBody{
+		Order: orderWireBody{
+			Salt: json.Number("78011896831834101158595025509514612777826333682964564215210608920542790493398"),
+		},
+		Owner:     "owner",
+		OrderType: "FAK",
+		DeferExec: false,
+		PostOnly:  false,
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("json.Marshal returned error: %v", err)
+	}
+
+	got := string(payload)
+	if strings.Contains(got, `"salt":"`) {
+		t.Fatalf("salt serialized as a string: %s", got)
+	}
+	if !strings.Contains(got, `"salt":78011896831834101158595025509514612777826333682964564215210608920542790493398`) {
+		t.Fatalf("salt did not serialize as a JSON number: %s", got)
+	}
+	if !strings.Contains(got, `"deferExec":false`) || !strings.Contains(got, `"postOnly":false`) {
+		t.Fatalf("expected explicit deferExec/postOnly flags: %s", got)
+	}
+}
+
+func TestBuildL2SignatureUsesURLSafeBase64(t *testing.T) {
+	got := buildL2Signature("c2VjcmV0", "1700000000", "POST", "/order", `{"x":1}`)
+	want := "Uc3z_vcj4K83dnLn8zBFPPSLPInoPi4jixQmfdQDv8s="
+
+	if got != want {
+		t.Fatalf("signature = %q, want %q", got, want)
+	}
+	if strings.ContainsAny(got, "+/") {
+		t.Fatalf("signature is not URL-safe base64: %q", got)
+	}
+}
+
+func TestOrderStatusCurrentDataOrderFields(t *testing.T) {
+	status := OrderStatus{
+		Status:      "ORDER_STATUS_MATCHED",
+		SizeMatched: "20202000",
+		Price:       "0.99",
+	}
+	status.normalize()
+
+	if status.Status != "matched" {
+		t.Fatalf("Status = %q, want matched", status.Status)
+	}
+	if got := status.FilledShares(); math.Abs(got-20.202) > 0.000001 {
+		t.Fatalf("FilledShares = %f, want 20.202", got)
+	}
+	if got := status.FillPrice(); math.Abs(got-0.99) > 0.000001 {
+		t.Fatalf("FillPrice = %f, want 0.99", got)
+	}
+	if got := status.FilledUSD(); math.Abs(got-19.99998) > 0.000001 {
+		t.Fatalf("FilledUSD = %f, want 19.99998", got)
+	}
+}

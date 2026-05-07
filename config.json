@@ -1,0 +1,18 @@
+{
+  "id": "ws_56be8688",
+  "name": "Polymarket-AI-bot-trader-by-Nothing",
+  "slug": "polymarket-ai-bot-trader-by-nothing",
+  "defaults": {
+    "permissionMode": "safe",
+    "cyclablePermissionModes": [
+      "safe",
+      "allow-all"
+    ],
+    "enabledSourceSlugs": []
+  },
+  "localMcpServers": {
+    "enabled": true
+  },
+  "createdAt": 1778080832572,
+  "updatedAt": 1778080832573
+}
