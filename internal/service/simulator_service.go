@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"regexp"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/silver/pmvibes/internal/simulator"
 	"github.com/silver/pmvibes/internal/store"
 	"github.com/silver/pmvibes/pkg/polymarket"
+	"github.com/silver/pmvibes/pkg/telegram"
 )
 
 // MaxFinanceHistoryLimit caps persisted rows returned from GET /finance (history_limit).
@@ -61,6 +63,13 @@ type SimulatorService struct {
 	priceClient *polymarket.PriceClient
 	discoverer  *simulator.MarketDiscoverer
 	logger      *slog.Logger
+	notifier    *telegram.Notifier
+	trader      *polymarket.Trader // kept for balance polling
+
+	// lastNotifiedBalance is the USDC amount last sent to Telegram; guarded by
+	// lastNotifiedBalanceMu. nil means we have not successfully notified yet.
+	lastNotifiedBalanceMu sync.Mutex
+	lastNotifiedBalance   *float64
 
 	currentPrice float64
 	lastPriceAt  time.Time
@@ -136,11 +145,22 @@ func NewSimulatorService(logger *slog.Logger, eventLog store.EventRecorder) *Sim
 	strategy := simulator.NewStrategy(simulator.DefaultStrategyConfig())
 	engine := simulator.NewEngine(strategy, client) // Pass client for real order book prices
 
+	tgNotifier := telegram.NewNotifier(
+		os.Getenv("TELEGRAM_BOT_TOKEN"),
+		os.Getenv("TELEGRAM_CHAT_ID"),
+	)
+	if tgNotifier.Enabled() {
+		logger.Info("telegram notifications enabled")
+	} else {
+		logger.Info("telegram notifications disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+	}
+
 	s := &SimulatorService{
 		client:          client,
 		engine:          engine,
 		discoverer:      simulator.NewMarketDiscoverer(client),
 		logger:          logger,
+		notifier:        tgNotifier,
 		startTime:       time.Now(),
 		logs:            make([]LogEntry, 0),
 		liveOrderTokens: make(map[string]struct{}),
@@ -155,6 +175,12 @@ func NewSimulatorService(logger *slog.Logger, eventLog store.EventRecorder) *Sim
 				sigType = n
 			}
 		}
+		clobAudit := strings.TrimSpace(os.Getenv("CLOB_AUDIT_LOG"))
+		if strings.EqualFold(clobAudit, "-") || strings.EqualFold(clobAudit, "off") {
+			clobAudit = ""
+		} else if clobAudit == "" {
+			clobAudit = "clob_audit.jsonl"
+		}
 		cfg := polymarket.TraderConfig{
 			PrivateKeyHex: os.Getenv("POLYMARKET_PRIVATE_KEY"),
 			ProxyWallet:   os.Getenv("POLYMARKET_PROXY_WALLET"),
@@ -162,12 +188,17 @@ func NewSimulatorService(logger *slog.Logger, eventLog store.EventRecorder) *Sim
 			APISecret:     os.Getenv("POLYMARKET_API_SECRET"),
 			APIPassphrase: os.Getenv("POLYMARKET_API_PASSPHRASE"),
 			SignatureType: sigType,
+			ClobAuditLog:  clobAudit,
 		}
 		trader, err := polymarket.NewTrader(cfg)
 		if err != nil {
 			logger.Error("live trading disabled — credential error", "err", err)
 		} else {
 			logger.Info("LIVE TRADING ENABLED")
+			if clobAudit != "" {
+				logger.Info("CLOB requests will be appended to JSONL audit file", "path", clobAudit)
+			}
+			s.trader = trader
 			engine.SetLiveTradeCallback(func(ctx context.Context, tokenID string, direction simulator.Direction, amountUSD, entryPrice float64) {
 				if !s.reserveLiveOrder(tokenID) {
 					logger.Warn("duplicate live order skipped", "direction", direction, "tokenID", tokenID)
@@ -188,12 +219,20 @@ func NewSimulatorService(logger *slog.Logger, eventLog store.EventRecorder) *Sim
 				s.addLog("INFO", fmt.Sprintf("LIVE ORDER PLACED: %s $%.2f @ %.4f — orderID: %s",
 					direction, amountUSD, entryPrice, result.OrderID))
 
-				// FAK orders settle almost immediately; poll for the actual fill.
+				s.notifier.SendHTML(ctx, fmt.Sprintf(
+					"<b>📥 开单通知</b>\n"+
+					"方向: <b>%s</b>\n"+
+					"金额: $%.2f\n"+
+					"入场价: %.4f\n"+
+					"订单ID: <code>%s</code>",
+					direction, amountUSD, entryPrice, result.OrderID))
+
+				// FOK orders settle almost immediately; poll for the actual fill.
 				if result.OrderID == "" {
 					return
 				}
 				go func(orderID string) {
-					// Give the CLOB up to ~3 seconds to settle the FAK order.
+					// Give the CLOB up to ~3 seconds to settle the FOK order.
 					ticker := time.NewTicker(500 * time.Millisecond)
 					defer ticker.Stop()
 					deadline := time.After(3 * time.Second)
@@ -223,11 +262,25 @@ func NewSimulatorService(logger *slog.Logger, eventLog store.EventRecorder) *Sim
 									"fillPrice", fillPrice, "status", status.Status)
 								s.addLog("INFO", fmt.Sprintf("LIVE ORDER FILLED: %s — $%.4f spent, %.4f shares @ %.4f (status: %s)",
 									direction, filledUSD, filledShares, fillPrice, status.Status))
+								s.notifier.SendHTML(context.Background(), fmt.Sprintf(
+										"<b>✅ 订单成交</b>\n"+
+										"方向: <b>%s</b>\n"+
+										"成交金额: $%.4f\n"+
+										"成交份额: %.4f\n"+
+										"成交价格: %.4f\n"+
+										"订单ID: <code>%s</code>",
+										direction, filledUSD, filledShares, fillPrice, orderID))
 							} else {
 								logger.Info("live order CANCELLED (no fill)",
 									"direction", direction, "orderID", orderID, "status", status.Status)
 								s.addLog("WARN", fmt.Sprintf("LIVE ORDER CANCELLED (no fill): %s orderID %s — insufficient liquidity?",
 									direction, orderID))
+								s.notifier.SendHTML(context.Background(), fmt.Sprintf(
+										"<b>⚠️ 订单未成交</b>\n"+
+										"方向: <b>%s</b>\n"+
+										"订单ID: <code>%s</code>\n"+
+										"原因: 流动性不足",
+										direction, orderID))
 							}
 							return
 						}
@@ -244,9 +297,21 @@ func NewSimulatorService(logger *slog.Logger, eventLog store.EventRecorder) *Sim
 		if trade.Outcome == simulator.OutcomePending {
 			s.addLog("INFO", fmt.Sprintf("TRADE ENTERED #%d: %s @ $%.2f, target $%.2f",
 				trade.ID, trade.Direction, trade.EntryBTCPrice, trade.PriceToBeat))
+			// Live order notification is handled in the live trade callback above.
+			// Notify for simulation mode trades too:
+			if s.trader == nil {
+				s.notifier.SendHTML(context.Background(), fmt.Sprintf(
+					"<b>📥 模拟开单</b>\n"+
+						"方向: <b>%s</b>\n"+
+						"入场BTC价: $%.2f\n"+
+						"目标价: $%.2f\n"+
+						"入场token价: %.4f",
+					trade.Direction, trade.EntryBTCPrice, trade.PriceToBeat, trade.EntryPrice))
+			}
 		} else {
 			s.addLog("INFO", fmt.Sprintf("TRADE RESOLVED #%d: %s, PnL: $%.2f",
 				trade.ID, trade.Outcome, trade.PnL))
+			s.notifyTradeResolved(trade)
 		}
 		s.persistEvent("trade", trade)
 	})
@@ -263,6 +328,20 @@ func NewSimulatorService(logger *slog.Logger, eventLog store.EventRecorder) *Sim
 		}
 		s.addLog("INFO", fmt.Sprintf("ROUND ENDED: %s, Final: $%.2f, Target: $%.2f",
 			result, outcome.FinalPrice, outcome.PriceToBeat))
+		if outcome.WeTradedIt {
+			pnlEmoji := "💰"
+			if outcome.OurPnL < 0 {
+				pnlEmoji = "📉"
+			}
+			s.notifier.SendHTML(context.Background(), fmt.Sprintf(
+				"<b>%s 市场结束</b>\n"+
+					"结果: <b>%s</b>\n"+
+					"我们的方向: %s\n"+
+					"最终价格: $%.2f\n"+
+					"目标价格: $%.2f\n"+
+					"盈亏: <b>$%.2f</b>",
+				pnlEmoji, result, outcome.OurDirection, outcome.FinalPrice, outcome.PriceToBeat, outcome.OurPnL))
+		}
 		s.persistEvent("outcome", outcome)
 	})
 
@@ -278,6 +357,48 @@ func (s *SimulatorService) reserveLiveOrder(tokenID string) bool {
 	}
 	s.liveOrderTokens[tokenID] = struct{}{}
 	return true
+}
+
+func (s *SimulatorService) notifyTradeResolved(trade simulator.SimulatedTrade) {
+	if !s.notifier.Enabled() {
+		return
+	}
+	var title, emoji string
+	switch trade.ExitReason {
+	case simulator.ExitReasonTakeProfit:
+		title = "止盈平仓"
+		emoji = "🎯"
+	case simulator.ExitReasonStopLoss:
+		title = "止损平仓"
+		emoji = "🛑"
+	case simulator.ExitReasonTrailingStop:
+		title = "移动止损平仓"
+		emoji = "📉"
+	case simulator.ExitReasonMarketEnd:
+		title = "到期结算"
+		emoji = "🏁"
+	default:
+		if trade.Outcome == simulator.OutcomeWin {
+			title = "到期盈利"
+			emoji = "🎉"
+		} else {
+			title = "到期亏损"
+			emoji = "💸"
+		}
+	}
+
+	pnlEmoji := "✅"
+	if trade.PnL < 0 {
+		pnlEmoji = "❌"
+	}
+
+	s.notifier.SendHTML(context.Background(), fmt.Sprintf(
+		"<b>%s %s</b>\n"+
+			"方向: <b>%s</b>\n"+
+			"入场价: %.4f\n"+
+			"出场价: %.4f\n"+
+			"盈亏: <b>%s $%.2f</b>",
+		emoji, title, trade.Direction, trade.EntryPrice, trade.ExitPrice, pnlEmoji, trade.PnL))
 }
 
 func (s *SimulatorService) persistEvent(kind string, data any) {
@@ -361,7 +482,70 @@ func (s *SimulatorService) Start(ctx context.Context) error {
 	// Start market resolution
 	go s.marketResolutionLoop(ctx)
 
+	// Start Telegram balance reporter (every 5 minutes)
+	if s.notifier.Enabled() && s.trader != nil {
+		go s.balanceReporterLoop(ctx)
+	}
+
 	return nil
+}
+
+func (s *SimulatorService) balanceReporterLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	// Send first report immediately
+	s.sendBalanceReport(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.sendBalanceReport(ctx)
+		}
+	}
+}
+
+func (s *SimulatorService) sendBalanceReport(ctx context.Context) {
+	if s.trader == nil {
+		return
+	}
+	balCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	balance, err := s.trader.GetBalance(balCtx)
+	if err != nil {
+		s.logger.Warn("balance report failed", "err", err)
+		s.notifier.SendHTML(ctx, fmt.Sprintf(
+			"<b>💰 账户余额</b>\n"+
+				"查询失败: %v", err))
+		return
+	}
+
+	s.lastNotifiedBalanceMu.Lock()
+	prev := s.lastNotifiedBalance
+	changed := prev == nil || !usdcBalanceEqual(*prev, balance)
+	if changed {
+		v := balance
+		s.lastNotifiedBalance = &v
+	}
+	s.lastNotifiedBalanceMu.Unlock()
+
+	if !changed {
+		s.logger.Debug("balance unchanged, skip telegram", "usdc", balance)
+		return
+	}
+
+	s.notifier.SendHTML(ctx, fmt.Sprintf(
+		"<b>💰 账户余额报告</b>\n"+
+			"USDC 余额: <b>$%.2f</b>\n"+
+			"时间: %s",
+		balance, time.Now().Format("2006-01-02 15:04:05 MST")))
+}
+
+// usdcBalanceEqual compares CLOB USDC amounts (~2 display decimals); half-cent tolerance.
+func usdcBalanceEqual(a, b float64) bool {
+	return math.Abs(a-b) < 0.005
 }
 
 func (s *SimulatorService) marketDiscoveryLoop(ctx context.Context) {

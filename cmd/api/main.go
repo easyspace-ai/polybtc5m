@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/silver/pmvibes/internal/config"
@@ -16,7 +20,25 @@ import (
 func main() {
 	config.LoadDotEnv()
 
-	logger := slog.New(logging.NewHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	logOut := io.Writer(os.Stdout)
+	if path := strings.TrimSpace(os.Getenv("LOG_FILE")); path != "" {
+		path = filepath.Clean(path)
+		if d := filepath.Dir(path); d != "." && d != "" {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				fmt.Fprintln(os.Stderr, "LOG_FILE mkdir:", err)
+				os.Exit(1)
+			}
+		}
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "LOG_FILE open:", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		logOut = io.MultiWriter(os.Stdout, f)
+	}
+
+	logger := slog.New(logging.NewHandler(slog.NewJSONHandler(logOut, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
 	slog.SetDefault(logger)

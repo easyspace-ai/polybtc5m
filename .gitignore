@@ -1,5 +1,6 @@
 .DS_Store
 .env
+clob_audit.jsonl
 go.work
 go.work.sum
 /scripts/node_modules/

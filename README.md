@@ -155,6 +155,9 @@ POLYMARKET_PRIVATE_KEY=0x<your-64-hex-private-key> node scripts/gen-api-keys.mjs
 | `POLYMARKET_API_PASSPHRASE` | Live trading | CLOB API passphrase (from `gen-api-keys.mjs`) |
 | `POLYMARKET_SIG_TYPE` | Live trading | `0` = EOA. `1` = POLY_PROXY. `2` = GNOSIS_SAFE. `3` = POLY_1271 / **deposit wallet** (new API users). |
 | `POLYMARKET_PROXY_WALLET` | Live trading | Proxy / funder from profile for types `1`–`2`; for type `3`, the deposit wallet used as order maker/signer; for type `0`, your EOA address. |
+| `TAKE_PROFIT_PERCENT` | No | Take-profit threshold as a decimal fraction (default: `0.20` for 20%). |
+| `STOP_LOSS_PERCENT` | No | Stop-loss threshold as a decimal fraction (default: `0.10` for 10%). |
+| `TRAILING_STOP_PERCENT` | No | Trailing-stop threshold as a decimal fraction (default: `0.10` for 10%). |
 | `REDIS_URL` | No | Redis connection string. If empty, event log is in-memory only. |
 | `PROXY_URL` | No | HTTP proxy for all outbound traffic (e.g. `http://127.0.0.1:15236`). If empty, direct connection is used. |
 

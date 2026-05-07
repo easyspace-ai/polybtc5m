@@ -17,6 +17,8 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -57,6 +59,9 @@ const (
 	collateralScale         = 1_000_000
 	marketBuyMakerPrecision = 10_000 // 2 decimals in 6-decimal fixed units
 	marketBuyTakerPrecision = 100    // 4 decimals in 6-decimal fixed units
+	// defaultMarketSlippageMult widens worst limit vs entry for market BUY (FOK).
+	// Override with POLYMARKET_MARKET_SLIPPAGE_MULT (e.g. 1.25 for 1.0–2.0).
+	defaultMarketSlippageMult = 1.18
 )
 
 // TraderConfig holds all credentials needed for live order placement.
@@ -73,6 +78,9 @@ type TraderConfig struct {
 	// SignatureType: 1=POLY_PROXY (Telegram/email/Google), 2=GNOSIS_SAFE (browser wallet),
 	// 3=POLY_1271 (deposit wallet — required for new API users).
 	SignatureType int
+	// ClobAuditLog is a path for append-only JSONL (one object per line) recording POST /order
+	// and GET /data/order/{id} outcomes including HTTP status and response body. Empty disables.
+	ClobAuditLog string
 }
 
 // OrderResult is returned by PlaceMarketOrder.
@@ -159,6 +167,8 @@ type Trader struct {
 	orderTypeHash    []byte
 	domainSeparator  []byte
 	poly1271TypeHash []byte // TypedDataSign type hash for POLY_1271 (ERC-7739)
+
+	audit *clobAuditWriter // optional CLOB JSONL audit trail
 }
 
 // NewTrader validates the config and returns a ready-to-use Trader.
@@ -185,17 +195,25 @@ func NewTrader(config TraderConfig) (*Trader, error) {
 	t.orderTypeHash = crypto.Keccak256([]byte(orderTypeString))
 	t.domainSeparator = t.buildDomainSeparator()
 	t.poly1271TypeHash = crypto.Keccak256([]byte(poly1271TypeString))
+
+	if p := strings.TrimSpace(config.ClobAuditLog); p != "" {
+		w, err := newClobAuditWriter(p)
+		if err != nil {
+			return nil, fmt.Errorf("clob audit log: %w", err)
+		}
+		t.audit = w
+	}
 	return t, nil
 }
 
 // EOAAddress returns the public address derived from the private key.
 func (t *Trader) EOAAddress() string { return t.eoaAddress.Hex() }
 
-// PlaceMarketOrder submits a FAK (Fill and Kill) market buy order on CLOB V2.
+// PlaceMarketOrder submits a FOK (Fill or Kill) market buy order on CLOB V2.
 //
 //   - tokenID     – outcome token to buy (decimal string from Polymarket's clobTokenIds)
 //   - amountUSD   – pUSD to spend (e.g. 10.0 for $10)
-//   - entryPrice  – current best ask (0–1); used to calculate minimum acceptable shares
+//   - entryPrice  – current best ask (0–1); used to calculate worst limit price (see marketBuyWorstPriceMult)
 func (t *Trader) PlaceMarketOrder(ctx context.Context, tokenID string, amountUSD, entryPrice float64) (*OrderResult, error) {
 	if entryPrice <= 0 || entryPrice >= 1 {
 		return nil, fmt.Errorf("entry price %f out of range (0,1)", entryPrice)
@@ -266,7 +284,7 @@ func (t *Trader) PlaceMarketOrder(ctx context.Context, tokenID string, amountUSD
 			Signature:     sig,
 		},
 		Owner:     t.config.APIKey,
-		OrderType: "FAK",
+		OrderType: "FOK",
 		DeferExec: false,
 		PostOnly:  false,
 	}
@@ -296,6 +314,11 @@ func (t *Trader) PlaceMarketOrder(ctx context.Context, tokenID string, amountUSD
 
 	resp, err := t.httpClient.Do(req)
 	if err != nil {
+		t.audit.appendRecord(map[string]any{
+			"op": "post_order", "token_id": tokenID, "amount_usd": amountUSD, "entry_price": entryPrice,
+			"maker_amount": makerAmount, "taker_amount": takerAmount,
+			"transport_error": err.Error(),
+		})
 		return nil, fmt.Errorf("POST /order: %w", err)
 	}
 	defer resp.Body.Close()
@@ -304,14 +327,36 @@ func (t *Trader) PlaceMarketOrder(ctx context.Context, tokenID string, amountUSD
 	var result OrderResult
 	_ = json.Unmarshal(respBytes, &result)
 
+	rec := map[string]any{
+		"op": "post_order", "http_status": resp.StatusCode,
+		"token_id": tokenID, "amount_usd": amountUSD, "entry_price": entryPrice,
+		"maker_amount": makerAmount, "taker_amount": takerAmount,
+		"order_id": result.OrderID, "order_status": result.Status, "order_error": result.ErrorMsg,
+		"response_body": truncateClobAuditBody(string(respBytes)),
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		slog.ErrorContext(ctx, "clob order rejected",
 			"status", resp.StatusCode,
 			"response", string(respBytes),
 			"payload", payload)
+		rec["clob_error"] = fmt.Sprintf("CLOB %d: %s", resp.StatusCode, string(respBytes))
+		t.audit.appendRecord(rec)
 		return &result, fmt.Errorf("CLOB %d: %s", resp.StatusCode, string(respBytes))
 	}
+	t.audit.appendRecord(rec)
 	return &result, nil
+}
+
+func marketBuyWorstPriceMult() float64 {
+	v := strings.TrimSpace(os.Getenv("POLYMARKET_MARKET_SLIPPAGE_MULT"))
+	if v == "" {
+		return defaultMarketSlippageMult
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 1.0 || f > 2.0 {
+		return defaultMarketSlippageMult
+	}
+	return f
 }
 
 func marketBuyAmounts(amountUSD, entryPrice float64) (int64, int64, error) {
@@ -322,7 +367,8 @@ func marketBuyAmounts(amountUSD, entryPrice float64) (int64, int64, error) {
 	// Market buys are still limit orders: price is the worst acceptable fill.
 	// BTC 5m markets normally trade on a 1c tick, so keep the signed ratio on-tick
 	// and never submit the invalid $1.00 binary-token price.
-	worstPrice := math.Ceil(entryPrice*1.05/defaultTickSize) * defaultTickSize
+	mult := marketBuyWorstPriceMult()
+	worstPrice := math.Ceil(entryPrice*mult/defaultTickSize) * defaultTickSize
 	if worstPrice > maxBinaryBuyPrice {
 		worstPrice = maxBinaryBuyPrice
 	}
@@ -361,8 +407,56 @@ func roundDownInt(amount float64, precision int64) int64 {
 	return units - units%precision
 }
 
+// BalanceAllowanceResponse is the CLOB /balance-allowance JSON body (clob-client-v2 getBalanceAllowance).
+type BalanceAllowanceResponse struct {
+	Balance   string `json:"balance"`
+	Allowance string `json:"allowance"`
+}
+
+// GetBalance returns tradable CLOB collateral in USDC (6 decimal raw units → float), via
+// GET /balance-allowance?asset_type=COLLATERAL&signature_type=… with L2 auth — the same notion
+// as polymarket-sdk balances.GetBalance(COLLATERAL) used in bak/polymarket-go.
+//
+// On-chain USDC.e balanceOf(proxy) is often 0 after funds are deposited for trading; do not use that for reporting.
+func (t *Trader) GetBalance(ctx context.Context) (float64, error) {
+	const path = "/balance-allowance"
+	q := url.Values{}
+	q.Set("asset_type", "COLLATERAL")
+	q.Set("signature_type", strconv.Itoa(t.config.SignatureType))
+	requestURL := clobBaseURL + path + "?" + q.Encode()
+
+	headers := t.l2AuthHeaders(http.MethodGet, path, "")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return 0, fmt.Errorf("create balance request: %w", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("GET %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("CLOB %s %d: %s", path, resp.StatusCode, string(body))
+	}
+
+	var out BalanceAllowanceResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0, fmt.Errorf("decode balance: %w", err)
+	}
+	raw, err := strconv.ParseFloat(strings.TrimSpace(out.Balance), 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse balance %q: %w", out.Balance, err)
+	}
+	return raw / collateralScale, nil
+}
+
 // GetOrderStatus fetches the current status of an order from CLOB V2.
-// FAK orders settle within milliseconds; call this after a short delay.
+// FOK orders settle quickly; call this after a short delay.
 func (t *Trader) GetOrderStatus(ctx context.Context, orderID string) (*OrderStatus, error) {
 	path := "/data/order/" + orderID
 	headers := t.l2AuthHeaders("GET", path, "")
@@ -377,20 +471,38 @@ func (t *Trader) GetOrderStatus(ctx context.Context, orderID string) (*OrderStat
 
 	resp, err := t.httpClient.Do(req)
 	if err != nil {
+		t.audit.appendRecord(map[string]any{
+			"op": "get_order", "order_id": orderID, "transport_error": err.Error(),
+		})
 		return nil, fmt.Errorf("GET /order: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
+	rec := map[string]any{
+		"op": "get_order", "http_status": resp.StatusCode, "order_id": orderID,
+		"response_body": truncateClobAuditBody(string(body)),
+	}
 	if resp.StatusCode != http.StatusOK {
+		rec["clob_error"] = fmt.Sprintf("CLOB %d: %s", resp.StatusCode, string(body))
+		t.audit.appendRecord(rec)
 		return nil, fmt.Errorf("CLOB %d: %s", resp.StatusCode, string(body))
 	}
 
 	var status OrderStatus
 	if err := json.Unmarshal(body, &status); err != nil {
+		rec["decode_error"] = err.Error()
+		t.audit.appendRecord(rec)
 		return nil, fmt.Errorf("decode order status: %w", err)
 	}
 	status.normalize()
+	rec["status"] = status.Status
+	rec["size_matched"] = status.SizeMatched
+	rec["original_size"] = status.OriginalSize
+	rec["price"] = status.Price
+	rec["maker_amount_filled"] = status.MakerAmountFilled
+	rec["taker_amount_filled"] = status.TakerAmountFilled
+	t.audit.appendRecord(rec)
 	return &status, nil
 }
 
@@ -586,7 +698,7 @@ type orderWireBody struct {
 type postOrderBody struct {
 	Order     orderWireBody `json:"order"`
 	Owner     string        `json:"owner"`     // API key
-	OrderType string        `json:"orderType"` // "FOK"
+	OrderType string        `json:"orderType"` // "FOK" | "FAK" | …
 	DeferExec bool          `json:"deferExec"`
 	PostOnly  bool          `json:"postOnly"`
 }

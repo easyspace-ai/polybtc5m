@@ -109,11 +109,11 @@ func main() {
 		}
 	}
 
-	fmt.Println("\n========== Add these to your .env ==========\n")
+	fmt.Println("\n========== Add these to your .env ==========")
 	fmt.Printf("POLYMARKET_API_KEY=%s\n", creds.ApiKey)
 	fmt.Printf("POLYMARKET_API_SECRET=%s\n", creds.Secret)
 	fmt.Printf("POLYMARKET_API_PASSPHRASE=%s\n", creds.Passphrase)
-	fmt.Println("\n============================================")
+	fmt.Println("============================================")
 	fmt.Printf("\n✅ API key bound to EOA: %s\n", eoaAddr.Hex())
 	fmt.Println("\n💾 Save these now — the secret and passphrase cannot be retrieved again.")
 }

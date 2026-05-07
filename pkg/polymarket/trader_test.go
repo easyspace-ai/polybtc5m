@@ -8,6 +8,7 @@ import (
 )
 
 func TestMarketBuyAmountsCapsHighPriceAtNinetyNineCents(t *testing.T) {
+	t.Setenv("POLYMARKET_MARKET_SLIPPAGE_MULT", "1.05")
 	makerAmount, takerAmount, err := marketBuyAmounts(20, 0.9900000000000001)
 	if err != nil {
 		t.Fatalf("marketBuyAmounts returned error: %v", err)
@@ -28,6 +29,7 @@ func TestMarketBuyAmountsCapsHighPriceAtNinetyNineCents(t *testing.T) {
 }
 
 func TestMarketBuyAmountsRoundsWorstPriceToTick(t *testing.T) {
+	t.Setenv("POLYMARKET_MARKET_SLIPPAGE_MULT", "1.05")
 	makerAmount, takerAmount, err := marketBuyAmounts(20, 0.60)
 	if err != nil {
 		t.Fatalf("marketBuyAmounts returned error: %v", err)
@@ -53,7 +55,7 @@ func TestPostOrderBodySerializesSaltAsNumber(t *testing.T) {
 			Salt: json.Number("78011896831834101158595025509514612777826333682964564215210608920542790493398"),
 		},
 		Owner:     "owner",
-		OrderType: "FAK",
+		OrderType: "FOK",
 		DeferExec: false,
 		PostOnly:  false,
 	}
